@@ -189,7 +189,7 @@ final class Session {
         return sb.toString();
     }
 
-    String stops(List<String> mine, List<String> opp, Boolean passOwnStack) {
+    String stops(List<String> mine, List<String> opp, Boolean passOwnStack, Boolean passAbilities) {
         ClaudeGuiGame g = requireGui();
         synchronized (g) {
             if (mine != null) {
@@ -201,8 +201,10 @@ final class Session {
                 for (String p : opp) g.oppStops.add(forge.game.phase.PhaseType.valueOf(p.toUpperCase()));
             }
             if (passOwnStack != null) g.passOnOwnStack = passOwnStack;
+            if (passAbilities != null) g.passOnAbilities = passAbilities;
             return "Stops on your turn: " + g.myStops + "; on opponents' turns: " + g.oppStops
-                    + "; pass when only your own items are on the stack: " + g.passOnOwnStack;
+                    + "; pass when only your own items are on the stack: " + g.passOnOwnStack
+                    + "; pass when only abilities are on the stack: " + g.passOnAbilities;
         }
     }
 

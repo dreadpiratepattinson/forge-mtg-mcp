@@ -51,6 +51,8 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     private boolean enable1, enable2;
     private final List<CardView> selectables = new ArrayList<>();
     private long promptVersion, consumedVersion, lastChange;
+    /** Prompt version just before the last click of an answer; prompts up to it are stale. */
+    private long lastClickVersion;
     private Decision prompt;
     private boolean gameOver;
     /** Messages and errors from the server since the last forge_wait. */
@@ -60,6 +62,8 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     final Set<PhaseType> myStops = EnumSet.of(PhaseType.MAIN1, PhaseType.MAIN2);
     final Set<PhaseType> oppStops = EnumSet.noneOf(PhaseType.class);
     boolean passOnOwnStack = true;
+    /** Pass by yourself when the stack holds only abilities (no spells), whoever controls them. */
+    boolean passOnAbilities = false;
 
     ClaudeGuiGame() {
         Render.mayView = this::mayView;
@@ -120,7 +124,7 @@ final class ClaudeGuiGame extends NetworkGuiGame {
                 d.reply.complete(value);
             } else {
                 // The server can send the next prompt while the answer is applied; that prompt stays open.
-                consumedVersion = Math.max(consumedVersion, answeredVersion);
+                consumedVersion = Math.max(consumedVersion, Math.max(answeredVersion, lastClickVersion));
                 if (promptVersion == answeredVersion) prompt = null;
             }
             notifyAll();
@@ -129,8 +133,22 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     }
 
     private boolean promptOpen() {
+        // A player-target prompt has no buttons and no card list, only its text.
         return controller != null && promptVersion > consumedVersion
-                && (enable1 || enable2 || !selectables.isEmpty());
+                && (enable1 || enable2 || !selectables.isEmpty()
+                    || (!promptText.isBlank() && !promptText.startsWith("Waiting for")));
+    }
+
+    /** Waits until the server changes the prompt after version v and the change settles, or the timeout passes. */
+    private synchronized void awaitPromptAfter(long v, long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+        while (true) {
+            long now = System.nanoTime();
+            if (promptVersion > v && now - lastChange >= SETTLE_NANOS) return;
+            long left = deadline - now;
+            if (left <= 0) return;
+            wait(Math.max(1, Math.min(left, SETTLE_NANOS) / 1_000_000L));
+        }
     }
 
     private void promptChanged() {
@@ -152,11 +170,12 @@ final class ClaudeGuiGame extends NetworkGuiGame {
         GameView gv = getGameView();
         if (gv == null || label2.startsWith(Localizer.getInstance().getMessage("lblUndo"))) return false;
         if (!gv.getStack().isEmpty()) {
-            if (!passOnOwnStack) return false;
+            boolean allMine = passOnOwnStack, allAbilities = passOnAbilities;
             for (StackItemView si : gv.getStack()) {
-                if (si.getActivatingPlayer() == null || si.getActivatingPlayer().getId() != me.getId()) return false;
+                if (si.getActivatingPlayer() == null || si.getActivatingPlayer().getId() != me.getId()) allMine = false;
+                if (!si.isAbility()) allAbilities = false;
             }
-            return true;
+            return allMine || allAbilities;
         }
         boolean myTurn = gv.getPlayerTurn() != null && gv.getPlayerTurn().getId() == me.getId();
         return !(myTurn ? myStops : oppStops).contains(gv.getPhase());
@@ -210,7 +229,20 @@ final class ClaudeGuiGame extends NetworkGuiGame {
                 default -> throw new IllegalArgumentException("Unknown action '" + verb + "'. Use ok, cancel, card <id>, player <index>.");
             }
         }
-        actions.forEach(Runnable::run);
+        // Each click changes the prompt; the next click must go to the new prompt, not the old one.
+        for (int i = 0; i < actions.size(); i++) {
+            long v;
+            synchronized (this) { v = promptVersion; lastClickVersion = v; }
+            actions.get(i).run();
+            if (i + 1 < actions.size()) {
+                try {
+                    awaitPromptAfter(v, 10_000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
         return null;
     }
 

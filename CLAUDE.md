@@ -33,6 +33,9 @@ Logs go to `build/`.
 2. Loop: `forge_wait` → read the DECISION → `forge_act` with its number.
 3. Read card text with `forge_card` before relying on it.
 4. `forge_stops` adds priority stops, e.g. the opponent's END_OF_TURN when holding instants.
+   `pass_on_abilities: true` skips the many passes on triggers and activations when you have no responses.
+5. Likely Forge 2.0.16 host bug (not yet reproduced on purpose): if the host clicks End Turn and so skips a block declaration against our attack,
+   the host crashes at combat damage (NPE in `Combat.assignAttackersDamage`). Ask the host to click OK at blocks.
 
 Prompt answers: `ok`, `cancel`, `card <id>`, `player <index>`, joined with `;`. On a mana payment prompt,
 `ok` is Forge's auto-pay. Attackers and blockers: click creatures with `card <id>`, then `ok`.

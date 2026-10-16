@@ -164,7 +164,8 @@ public final class McpServer {
             new Tool("forge_stops", "Set the phases where you want priority on an empty stack. Phases: " + PHASES + ".",
                     schema("my_turn", "string[]", "Stops on your own turn. Default MAIN1, MAIN2.", false,
                             "opponent_turn", "string[]", "Stops on opponents' turns. Default none.", false,
-                            "pass_on_own_stack", "boolean", "Pass by yourself when only your own spells are on the stack. Default true.", false)),
+                            "pass_on_own_stack", "boolean", "Pass by yourself when only your own spells are on the stack. Default true.", false,
+                            "pass_on_abilities", "boolean", "Pass by yourself when the stack holds only abilities (triggers, activations), no spells. Default false.", false)),
             new Tool("forge_chat", "Send a chat message to the players.",
                     schema("message", "string", "The text.", true)),
             new Tool("forge_game", "Game control: concede, next_game, quit, disconnect.",
@@ -199,7 +200,8 @@ public final class McpServer {
                 case "forge_state" -> session.state();
                 case "forge_card" -> session.cards(ints(a, "ids"));
                 case "forge_stops" -> session.stops(strs(a, "my_turn"), strs(a, "opponent_turn"),
-                        a.has("pass_on_own_stack") ? a.get("pass_on_own_stack").getAsBoolean() : null);
+                        a.has("pass_on_own_stack") ? a.get("pass_on_own_stack").getAsBoolean() : null,
+                        a.has("pass_on_abilities") ? a.get("pass_on_abilities").getAsBoolean() : null);
                 case "forge_chat" -> session.chat(str(a, "message", ""));
                 case "forge_game" -> session.game(str(a, "action", ""));
                 default -> throw new IllegalArgumentException("Unknown tool " + name);
