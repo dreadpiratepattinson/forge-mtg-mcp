@@ -22,7 +22,7 @@ because Windows counts the WSL network as public.
 
 ```
 scripts/bootstrap.sh    # downloads JDK 17 and Gson into .tools/ — the system Java is not touched
-scripts/sync-forge.sh   # copies the Forge jar and res/ from C:\Games\forge-installer-2.0.15
+scripts/sync-forge.sh   # copies the Forge jar and res/ from C:\Games\forge-installer-2.0.16
 scripts/build.sh        # compiles the client against that Forge build
 ```
 
@@ -35,12 +35,13 @@ scripts/sync-forge.sh && scripts/build.sh
 ```
 
 Then restart your MCP client. Set `FORGE_INSTALL` if Forge is in a different folder.
+`CHANGELOG.md` lists what changed in the client for each Forge build, and how to check a new one.
 
 ## Settings
 
 | Variable | Default | Use |
 |---|---|---|
-| `FORGE_INSTALL` | `/mnt/c/Games/forge-installer-2.0.15` | Forge folder that `sync-forge.sh` copies |
+| `FORGE_INSTALL` | `/mnt/c/Games/forge-installer-2.0.16` | Forge folder that `sync-forge.sh` copies |
 | `FORGE_DECKS` | `%APPDATA%\Forge\decks` on WSL, else `~/.forge/decks` | deck folder the LLM reads |
 | `FORGE_HOST` | the Windows host of WSL | address of the Forge host |
 
