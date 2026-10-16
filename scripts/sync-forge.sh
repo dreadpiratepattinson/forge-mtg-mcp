@@ -3,7 +3,7 @@
 # Run again after each Forge update, then scripts/build.sh.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC="${FORGE_INSTALL:-/mnt/c/Games/forge-installer-2.0.15}"
+SRC="${FORGE_INSTALL:-/mnt/c/Games/forge-installer-2.0.16}"
 DST="$ROOT/.tools/forge"
 rm -rf "$DST" && mkdir -p "$DST"
 cp "$SRC"/forge-gui-desktop-*-jar-with-dependencies.jar "$SRC/build.txt" "$DST/"

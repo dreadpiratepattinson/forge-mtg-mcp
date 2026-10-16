@@ -79,7 +79,7 @@ final class Render {
         String text = c.getText();
         if (text == null || text.isBlank()) text = s.getOracleText();
         if (text != null && !text.isBlank()) sb.append("  ").append(text.trim().replace("\n", "\n  ")).append('\n');
-        if (c.hasBackSide() && c.getBackSideName() != null) sb.append("  back side: ").append(c.getBackSideName()).append('\n');
+        if (c.hasAlternateState() && c.getAlternateState() != null) sb.append("  back side: ").append(c.getAlternateState().getName()).append('\n');
         return sb.toString();
     }
 

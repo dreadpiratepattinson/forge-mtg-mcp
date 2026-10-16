@@ -15,7 +15,7 @@ window on Windows; this repo's MCP server (`forge`, see `.mcp.json`) joins it as
 
 ```
 scripts/bootstrap.sh    # project-local JDK 17 + Gson in .tools/ (never the system Java)
-scripts/sync-forge.sh   # copy jar + res/ from C:\Games\forge-installer-2.0.15 (reads from /mnt/c are slow)
+scripts/sync-forge.sh   # copy jar + res/ from C:\Games\forge-installer-2.0.16 (reads from /mnt/c are slow)
 scripts/build.sh        # compile against .tools/forge
 ```
 

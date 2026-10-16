@@ -3,7 +3,6 @@ package mtgmcp;
 import forge.LobbyPlayer;
 import forge.deck.CardPool;
 import forge.game.GameEntityView;
-import forge.game.GameState;
 import forge.game.GameView;
 import forge.game.card.CardView;
 import forge.game.phase.PhaseType;
@@ -19,7 +18,6 @@ import forge.interfaces.IGameController;
 import forge.item.PaperCard;
 import forge.localinstance.skin.FSkinProp;
 import forge.player.PlayerZoneUpdate;
-import forge.player.PlayerZoneUpdates;
 import forge.trackable.TrackableCollection;
 import forge.util.FSerializableFunction;
 import forge.util.ITriggerEvent;
@@ -107,19 +105,23 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     /** Applies an answer to the open decision with this id. Returns a short confirmation. */
     String answer(int id, String answer) {
         Decision d;
+        long answeredVersion;
         synchronized (this) {
             d = current();
             if (d == null || d.id != id) {
                 return "Decision #" + id + " is not open any more. Call forge_wait.";
             }
+            answeredVersion = promptVersion;
         }
+        Log.info("answer #" + id + " at v" + answeredVersion + ": " + answer.trim());
         Object value = d.parser.apply(answer.trim()); // throws IllegalArgumentException on a bad answer
         synchronized (this) {
             if (d == dialog) {
                 d.reply.complete(value);
             } else {
-                consumedVersion = promptVersion;
-                prompt = null;
+                // The server can send the next prompt while the answer is applied; that prompt stays open.
+                consumedVersion = Math.max(consumedVersion, answeredVersion);
+                if (promptVersion == answeredVersion) prompt = null;
             }
             notifyAll();
         }
@@ -489,6 +491,7 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     public synchronized void showPromptMessage(PlayerView playerView, String message, CardView card) {
         promptText = message == null ? "" : message;
         promptChanged();
+        Log.info("prompt v" + promptVersion + " (consumed v" + consumedVersion + "): " + promptText.replace('\n', ' '));
     }
 
     @Override
@@ -498,6 +501,7 @@ final class ClaudeGuiGame extends NetworkGuiGame {
         enable1 = e1;
         enable2 = e2;
         promptChanged();
+        Log.info("buttons v" + promptVersion + ": " + label1 + "=" + e1 + " " + label2 + "=" + e2);
     }
 
     @Override
@@ -564,9 +568,9 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     // ---- display callbacks this client has no use for ----
 
     @Override protected void updateCurrentPlayer(PlayerView player) { }
+    // Forge's timer shows "Waiting for ..." with disabled buttons and can hide a prompt that arrived after it started.
+    @Override public void awaitNextInput() { }
     @Override public boolean isUiSetToSkipPhase(PlayerView playerTurn, PhaseType phase) { return false; }
-    @Override public PlayerZoneUpdates openZones(PlayerView controller, Collection<ZoneType> zones, Map<PlayerView, Object> players, boolean backupLastZones) { return null; }
-    @Override public void restoreOldZones(PlayerView playerView, PlayerZoneUpdates playerZoneUpdates) { }
     @Override public void openView(TrackableCollection<PlayerView> myPlayers) { }
     @Override public void showCombat() { }
     @Override public synchronized void flashIncorrectAction() { notices.add("Forge rejected the last action."); }
@@ -579,11 +583,8 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     @Override public void showManaPool(PlayerView player) { }
     @Override public void hideManaPool(PlayerView player) { }
     @Override public void updateStack() { }
-    @Override public Iterable<PlayerZoneUpdate> tempShowZones(PlayerView controller, Iterable<PlayerZoneUpdate> zonesToUpdate) { return zonesToUpdate; }
-    @Override public void hideZones(PlayerView controller, Iterable<PlayerZoneUpdate> zonesToUpdate) { }
     @Override public void updateZones(Iterable<PlayerZoneUpdate> zonesToUpdate) { }
     @Override public void updateCards(Iterable<CardView> cards) { }
-    @Override public GameState getGamestate() { return null; }
     @Override public void updateManaPool(Iterable<PlayerView> manaPoolUpdate) { }
     @Override public void updateLives(Iterable<PlayerView> livesUpdate) { }
     @Override public void updateShards(Iterable<PlayerView> shardsUpdate) { }
