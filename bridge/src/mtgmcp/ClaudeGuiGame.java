@@ -1,0 +1,609 @@
+package mtgmcp;
+
+import forge.LobbyPlayer;
+import forge.deck.CardPool;
+import forge.game.GameEntityView;
+import forge.game.GameState;
+import forge.game.GameView;
+import forge.game.card.CardView;
+import forge.game.phase.PhaseType;
+import forge.game.player.DelayedReveal;
+import forge.game.player.IHasIcon;
+import forge.game.player.PlayerView;
+import forge.game.spellability.SpellAbilityView;
+import forge.game.spellability.StackItemView;
+import forge.game.zone.ZoneType;
+import forge.gamemodes.net.NetworkGuiGame;
+import forge.gui.interfaces.IGuiGame;
+import forge.interfaces.IGameController;
+import forge.item.PaperCard;
+import forge.localinstance.skin.FSkinProp;
+import forge.player.PlayerZoneUpdate;
+import forge.player.PlayerZoneUpdates;
+import forge.trackable.TrackableCollection;
+import forge.util.FSerializableFunction;
+import forge.util.ITriggerEvent;
+import forge.util.Localizer;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.EnumSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Function;
+
+/**
+ * The client-side game GUI. Forge calls it as it would call the desktop match screen; every question becomes a
+ * {@link Decision} that the MCP tools read with {@link #awaitDecision} and answer with {@link #answer}.
+ */
+final class ClaudeGuiGame extends NetworkGuiGame {
+    private static final long SETTLE_NANOS = 250_000_000L;
+
+    private PlayerView me;
+    private IGameController controller;
+    private int nextId = 1;
+
+    // Blocking dialog, if one is open. Prompt state otherwise.
+    private Decision dialog;
+    private String promptText = "";
+    private String label1 = "", label2 = "";
+    private boolean enable1, enable2;
+    private final List<CardView> selectables = new ArrayList<>();
+    private long promptVersion, consumedVersion, lastChange;
+    private Decision prompt;
+    private boolean gameOver;
+    /** Messages and errors from the server since the last forge_wait. */
+    final List<String> notices = new ArrayList<>();
+
+    // Priority stops. Without a stop, the client passes priority on an empty stack by itself.
+    final Set<PhaseType> myStops = EnumSet.of(PhaseType.MAIN1, PhaseType.MAIN2);
+    final Set<PhaseType> oppStops = EnumSet.noneOf(PhaseType.class);
+    boolean passOnOwnStack = true;
+
+    ClaudeGuiGame() {
+        Render.mayView = this::mayView;
+    }
+
+    PlayerView me() { return me; }
+    synchronized boolean isGameOver() { return gameOver; }
+
+    // ---- decision access, called from MCP threads ----
+
+    /** Blocks until a decision is open, the game ends, or the timeout passes. Returns null on timeout. */
+    synchronized Decision awaitDecision(long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+        while (true) {
+            if (dialog != null && !dialog.reply.isDone()) return dialog;
+            if (gameOver) return null;
+            long now = System.nanoTime();
+            if (promptOpen()) {
+                if (now - lastChange >= SETTLE_NANOS) {
+                    if (isPriorityPrompt() && shouldAutoPass()) {
+                        Log.info("auto-pass: " + getGameView().getPhase());
+                        consumedVersion = promptVersion;
+                        controller.selectButtonOk();
+                        continue;
+                    }
+                    if (prompt == null) prompt = buildPrompt();
+                    return prompt;
+                }
+                wait(Math.max(1, (SETTLE_NANOS - (now - lastChange)) / 1_000_000L));
+                continue;
+            }
+            long left = deadline - now;
+            if (left <= 0) return null;
+            wait(Math.max(1, left / 1_000_000L));
+        }
+    }
+
+    synchronized Decision current() {
+        if (dialog != null && !dialog.reply.isDone()) return dialog;
+        return promptOpen() ? (prompt != null ? prompt : (prompt = buildPrompt())) : null;
+    }
+
+    /** Applies an answer to the open decision with this id. Returns a short confirmation. */
+    String answer(int id, String answer) {
+        Decision d;
+        synchronized (this) {
+            d = current();
+            if (d == null || d.id != id) {
+                return "Decision #" + id + " is not open any more. Call forge_wait.";
+            }
+        }
+        Object value = d.parser.apply(answer.trim()); // throws IllegalArgumentException on a bad answer
+        synchronized (this) {
+            if (d == dialog) {
+                d.reply.complete(value);
+            } else {
+                consumedVersion = promptVersion;
+                prompt = null;
+            }
+            notifyAll();
+        }
+        return "OK: answered #" + id + " with '" + answer.trim() + "'.";
+    }
+
+    private boolean promptOpen() {
+        return controller != null && promptVersion > consumedVersion
+                && (enable1 || enable2 || !selectables.isEmpty());
+    }
+
+    private void promptChanged() {
+        promptVersion++;
+        lastChange = System.nanoTime();
+        prompt = null;
+        notifyAll();
+    }
+
+    // ---- priority auto-pass ----
+
+    private boolean isPriorityPrompt() {
+        Localizer loc = Localizer.getInstance();
+        return enable1 && loc.getMessage("lblOK").equals(label1)
+                && (label2.equals(loc.getMessage("lblEndTurn")) || label2.startsWith(loc.getMessage("lblUndo")));
+    }
+
+    private boolean shouldAutoPass() {
+        GameView gv = getGameView();
+        if (gv == null || label2.startsWith(Localizer.getInstance().getMessage("lblUndo"))) return false;
+        if (!gv.getStack().isEmpty()) {
+            if (!passOnOwnStack) return false;
+            for (StackItemView si : gv.getStack()) {
+                if (si.getActivatingPlayer() == null || si.getActivatingPlayer().getId() != me.getId()) return false;
+            }
+            return true;
+        }
+        boolean myTurn = gv.getPlayerTurn() != null && gv.getPlayerTurn().getId() == me.getId();
+        return !(myTurn ? myStops : oppStops).contains(gv.getPhase());
+    }
+
+    // ---- prompt (Input) decisions ----
+
+    private Decision buildPrompt() {
+        List<String> opts = new ArrayList<>();
+        StringBuilder how = new StringBuilder();
+        if (enable1) how.append("'ok' = ").append(label1).append(". ");
+        if (enable2) how.append("'cancel' = ").append(label2).append(". ");
+        if (!selectables.isEmpty()) {
+            how.append("'card <id>' selects one of the cards below. ");
+            for (CardView c : selectables) opts.add(Render.cardLine(c));
+        } else {
+            how.append("'card <id>' clicks a card (cast/play from hand, activate on battlefield, or pick a target). ");
+        }
+        how.append("'player <index>' picks a player as shown in forge_state. Several actions: separate with ';'.");
+        String text = promptText;
+        GameView gv = getGameView();
+        if (gv != null) text = "[" + Render.phaseLine(gv, me) + "]\n" + text;
+        return new Decision(nextId++, "prompt", text, opts, how.toString(), this::actOnPrompt);
+    }
+
+    private Object actOnPrompt(String answer) {
+        List<Runnable> actions = new ArrayList<>();
+        for (String part : answer.split(";")) {
+            String[] w = part.trim().split("\\s+");
+            String verb = w[0].toLowerCase();
+            switch (verb) {
+                case "ok" -> {
+                    if (!enable1) throw new IllegalArgumentException("'" + label1 + "' (ok) is disabled now.");
+                    actions.add(controller::selectButtonOk);
+                }
+                case "cancel" -> {
+                    if (!enable2) throw new IllegalArgumentException("'" + label2 + "' (cancel) is disabled now.");
+                    actions.add(controller::selectButtonCancel);
+                }
+                case "card" -> {
+                    for (int i = 1; i < w.length; i++) {
+                        CardView c = findCard(Integer.parseInt(w[i]));
+                        if (c == null) throw new IllegalArgumentException("No visible card with id " + w[i] + ".");
+                        actions.add(() -> controller.selectCard(c, null, null));
+                    }
+                }
+                case "player" -> {
+                    PlayerView p = findPlayer(w.length > 1 ? w[1] : "");
+                    actions.add(() -> controller.selectPlayer(p, null));
+                }
+                default -> throw new IllegalArgumentException("Unknown action '" + verb + "'. Use ok, cancel, card <id>, player <index>.");
+            }
+        }
+        actions.forEach(Runnable::run);
+        return null;
+    }
+
+    CardView findCard(int id) {
+        for (CardView c : selectables) if (c.getId() == id) return c;
+        GameView gv = getGameView();
+        if (gv == null) return null;
+        for (PlayerView p : gv.getPlayers()) {
+            for (ZoneType z : Render.ZONES) {
+                Iterable<CardView> cards = p.getCards(z);
+                if (cards == null) continue;
+                for (CardView c : cards) if (c.getId() == id) return c;
+            }
+        }
+        for (StackItemView si : gv.getStack()) {
+            if (si.getSourceCard() != null && si.getSourceCard().getId() == id) return si.getSourceCard();
+        }
+        return null;
+    }
+
+    PlayerView findPlayer(String key) {
+        List<PlayerView> players = new ArrayList<>(getGameView().getPlayers());
+        try {
+            return players.get(Integer.parseInt(key));
+        } catch (NumberFormatException | IndexOutOfBoundsException e) {
+            for (PlayerView p : players) if (p.getName().equalsIgnoreCase(key)) return p;
+            throw new IllegalArgumentException("No player '" + key + "'. Use the index from forge_state.");
+        }
+    }
+
+    // ---- dialog decisions: these run on a Forge thread and block until answered ----
+
+    @SuppressWarnings("unchecked")
+    private <R> R ask(String kind, String text, List<String> options, String howTo, Function<String, Object> parser) {
+        Decision d;
+        synchronized (this) {
+            d = new Decision(nextId++, kind, text, options, howTo, parser);
+            dialog = d;
+            notifyAll();
+        }
+        try {
+            return (R) d.reply.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        } catch (ExecutionException e) {
+            throw new RuntimeException(e.getCause());
+        } finally {
+            synchronized (this) {
+                if (dialog == d) dialog = null;
+                notifyAll();
+            }
+        }
+    }
+
+    void abortDialogs() {
+        synchronized (this) {
+            if (dialog != null) dialog.reply.completeExceptionally(new IllegalStateException("disconnected"));
+            gameOver = true;
+            notifyAll();
+        }
+    }
+
+    private static List<Integer> indices(String answer, int size, int min, int max) {
+        List<Integer> out = new ArrayList<>();
+        String a = answer.trim().toLowerCase();
+        if (!a.isEmpty() && !a.equals("none")) {
+            for (String s : a.split("[,\\s]+")) {
+                int i = Integer.parseInt(s);
+                if (i < 0 || i >= size) throw new IllegalArgumentException("Index " + i + " is out of range 0.." + (size - 1) + ".");
+                if (out.contains(i)) throw new IllegalArgumentException("Index " + i + " is repeated.");
+                out.add(i);
+            }
+        }
+        if (out.size() < min || out.size() > max) {
+            throw new IllegalArgumentException("Choose between " + min + " and " + max + " items, not " + out.size() + ".");
+        }
+        return out;
+    }
+
+    private static boolean yesNo(String a) {
+        String s = a.toLowerCase();
+        if (s.startsWith("y") || s.equals("true") || s.equals("0")) return true;
+        if (s.startsWith("n") || s.equals("false") || s.equals("1")) return false;
+        throw new IllegalArgumentException("Answer yes or no.");
+    }
+
+    private static String describe(Object o) {
+        if (o instanceof CardView c) return Render.cardLine(c);
+        if (o instanceof PlayerView p) return "player " + p.getName();
+        if (o instanceof SpellAbilityView sa) return sa.toString();
+        return String.valueOf(o);
+    }
+
+    private static <T> List<String> describeAll(Collection<T> items, FSerializableFunction<T, String> display) {
+        List<String> out = new ArrayList<>();
+        for (T t : items) out.add(display != null ? display.apply(t) : describe(t));
+        return out;
+    }
+
+    @Override
+    public boolean confirm(CardView c, String question, boolean defaultIsYes, List<String> options) {
+        List<String> opts = options != null && options.size() == 2 ? options : List.of("Yes", "No");
+        String text = (c != null ? Render.cardLine(c) + "\n" : "") + question;
+        return ask("confirm", text, opts, "'yes' (option 0) or 'no' (option 1).", ClaudeGuiGame::yesNo);
+    }
+
+    @Override
+    public boolean showConfirmDialog(String message, String title, String yesButtonText, String noButtonText, boolean defaultYes) {
+        return ask("confirm", title + ": " + message, List.of(yesButtonText, noButtonText),
+                "'yes' (option 0) or 'no' (option 1).", ClaudeGuiGame::yesNo);
+    }
+
+    @Override
+    public int showOptionDialog(String message, String title, FSkinProp icon, List<String> options, int defaultOption) {
+        return ask("option", title + ": " + message, options, "the index of one option.",
+                a -> indices(a, options.size(), 1, 1).get(0));
+    }
+
+    @Override
+    public String showInputDialog(String message, String title, FSkinProp icon, String initialInput, List<String> inputOptions, boolean isNumeric) {
+        if (inputOptions != null && !inputOptions.isEmpty()) {
+            return ask("input", title + ": " + message, inputOptions, "the index of one option.",
+                    a -> inputOptions.get(indices(a, inputOptions.size(), 1, 1).get(0)));
+        }
+        return ask("input", title + ": " + message, List.of(),
+                (isNumeric ? "a number" : "free text") + (initialInput != null ? " (default '" + initialInput + "')" : "") + ".",
+                a -> {
+                    if (isNumeric) Integer.parseInt(a);
+                    return a;
+                });
+    }
+
+    @Override
+    public <T> List<T> getChoices(String message, int min, int max, List<T> choices, List<T> selected, FSerializableFunction<T, String> display) {
+        if (choices == null || choices.isEmpty()) return new ArrayList<>();
+        int hi = max < 0 ? choices.size() : Math.min(max, choices.size());
+        int lo = Math.max(0, Math.min(min, hi));
+        return ask("choose", message, describeAll(choices, display),
+                "indices separated by commas, between " + lo + " and " + hi + " of them" + (lo == 0 ? " ('none' for zero)" : "") + ".",
+                a -> {
+                    List<T> out = new ArrayList<>();
+                    for (int i : indices(a, choices.size(), lo, hi)) out.add(choices.get(i));
+                    return out;
+                });
+    }
+
+    @Override
+    public <T> IGuiGame.OrderResult<T> order(String title, String top, int remainingObjectsMin, int remainingObjectsMax, List<T> sourceChoices, List<T> destChoices, CardView referenceCard, boolean sideboardingMode, boolean showRememberCheckbox) {
+        String text = title + (top != null ? " (first = " + top + ")" : "");
+        return ask("order", text, describeAll(sourceChoices, null),
+                "all indices in the new order, first one first, or 'keep' for the order shown.",
+                a -> {
+                    if (a.equalsIgnoreCase("keep")) return new IGuiGame.OrderResult<>(sourceChoices, false);
+                    List<T> out = new ArrayList<>();
+                    for (int i : indices(a, sourceChoices.size(), sourceChoices.size(), sourceChoices.size())) out.add(sourceChoices.get(i));
+                    return new IGuiGame.OrderResult<>(out, false);
+                });
+    }
+
+    @Override
+    public List<PaperCard> sideboard(CardPool sideboard, CardPool main, String message) {
+        return main.toFlatList(); // no sideboarding: keep the main deck as it is
+    }
+
+    @Override
+    public GameEntityView chooseSingleEntityForEffect(String title, List<? extends GameEntityView> optionList, DelayedReveal delayedReveal, boolean isOptional) {
+        if (optionList == null || optionList.isEmpty()) return null;
+        String text = title + (delayedReveal != null ? "\n(revealed: " + describeAll(new ArrayList<>(delayedReveal.getCards()), null) + ")" : "");
+        return ask("choose", text, describeAll(new ArrayList<>(optionList), null),
+                "the index of one option" + (isOptional ? ", or 'none'." : "."),
+                a -> {
+                    List<Integer> ix = indices(a, optionList.size(), isOptional ? 0 : 1, 1);
+                    return ix.isEmpty() ? null : optionList.get(ix.get(0));
+                });
+    }
+
+    @Override
+    public List<GameEntityView> chooseEntitiesForEffect(String title, List<? extends GameEntityView> optionList, int min, int max, DelayedReveal delayedReveal) {
+        if (optionList == null || optionList.isEmpty()) return new ArrayList<>();
+        int hi = Math.min(max, optionList.size());
+        return ask("choose", title, describeAll(new ArrayList<>(optionList), null),
+                "indices separated by commas, between " + min + " and " + hi + " of them" + (min == 0 ? " ('none' for zero)" : "") + ".",
+                a -> {
+                    List<GameEntityView> out = new ArrayList<>();
+                    for (int i : indices(a, optionList.size(), min, hi)) out.add(optionList.get(i));
+                    return out;
+                });
+    }
+
+    @Override
+    public List<CardView> manipulateCardList(String title, Iterable<CardView> cards, Iterable<CardView> manipulable, boolean toTop, boolean toBottom, boolean toAnywhere) {
+        List<CardView> list = new ArrayList<>();
+        cards.forEach(list::add);
+        return ask("order", title, describeAll(list, null), "all indices in the new order, or 'keep'.",
+                a -> {
+                    if (a.equalsIgnoreCase("keep")) return list;
+                    List<CardView> out = new ArrayList<>();
+                    for (int i : indices(a, list.size(), list.size(), list.size())) out.add(list.get(i));
+                    return out;
+                });
+    }
+
+    @Override
+    public SpellAbilityView getAbilityToPlay(CardView hostCard, List<SpellAbilityView> abilities, ITriggerEvent triggerEvent) {
+        if (abilities == null || abilities.isEmpty()) return null;
+        // Same rule as the desktop screen: one ability that does not ask to be confirmed is played at once.
+        if (abilities.size() == 1 && !abilities.get(0).promptIfOnlyPossibleAbility()) return abilities.get(0);
+        return ask("ability", "Choose an ability of " + Render.cardLine(hostCard), describeAll(abilities, null),
+                "the index of one ability, or 'none' to play nothing.",
+                a -> {
+                    List<Integer> ix = indices(a, abilities.size(), 0, 1);
+                    return ix.isEmpty() ? null : abilities.get(ix.get(0));
+                });
+    }
+
+    @Override
+    public Map<CardView, Integer> assignCombatDamage(CardView attacker, List<CardView> blockers, int damage, GameEntityView defender, boolean overrideOrder, boolean maySkip) {
+        List<String> opts = describeAll(blockers, null);
+        if (defender != null) opts.add("defender: " + describe(defender));
+        return ask("damage", "Assign " + damage + " combat damage from " + Render.cardLine(attacker), opts,
+                "'i=n' pairs separated by commas that add up to " + damage + ", or 'auto' for lethal damage in order.",
+                a -> {
+                    Map<CardView, Integer> out = new LinkedHashMap<>();
+                    if (a.equalsIgnoreCase("auto")) {
+                        int left = damage;
+                        for (CardView b : blockers) {
+                            int dmg = Math.min(left, Math.max(0, b.getLethalDamage()));
+                            out.put(b, dmg);
+                            left -= dmg;
+                        }
+                        if (left > 0) {
+                            // Rest goes to the defender when trample allows it, else to the last blocker.
+                            CardView sink = defender instanceof CardView dc ? dc : (defender == null ? blockers.get(blockers.size() - 1) : null);
+                            if (sink != null) out.merge(sink, left, Integer::sum);
+                            else out.put(null, left);
+                        }
+                        return out;
+                    }
+                    int sum = 0;
+                    for (String pair : a.split(",")) {
+                        String[] kv = pair.trim().split("=");
+                        int i = Integer.parseInt(kv[0].trim()), n = Integer.parseInt(kv[1].trim());
+                        sum += n;
+                        if (i < blockers.size()) out.put(blockers.get(i), n);
+                        else if (i == blockers.size() && defender != null) out.put(defender instanceof CardView dc ? dc : null, n);
+                        else throw new IllegalArgumentException("Index " + i + " is out of range.");
+                    }
+                    if (sum != damage) throw new IllegalArgumentException("The amounts add up to " + sum + ", not " + damage + ".");
+                    return out;
+                });
+    }
+
+    @Override
+    public Map<Object, Integer> assignGenericAmount(CardView effectSource, Map<Object, Integer> target, int amount, boolean atLeastOne, String amountLabel) {
+        List<Object> keys = new ArrayList<>(target.keySet());
+        return ask("distribute", "Distribute " + amount + " " + amountLabel + " from " + Render.cardLine(effectSource)
+                        + (atLeastOne ? " (at least 1 each)" : ""), describeAll(keys, null),
+                "'i=n' pairs separated by commas that add up to " + amount + ".",
+                a -> {
+                    Map<Object, Integer> out = new LinkedHashMap<>();
+                    int sum = 0;
+                    for (String pair : a.split(",")) {
+                        String[] kv = pair.trim().split("=");
+                        int i = Integer.parseInt(kv[0].trim()), n = Integer.parseInt(kv[1].trim());
+                        if (i < 0 || i >= keys.size()) throw new IllegalArgumentException("Index " + i + " is out of range.");
+                        out.put(keys.get(i), n);
+                        sum += n;
+                    }
+                    if (sum != amount) throw new IllegalArgumentException("The amounts add up to " + sum + ", not " + amount + ".");
+                    return out;
+                });
+    }
+
+    // ---- prompt state, sent by the server ----
+
+    @Override
+    public synchronized void showPromptMessage(PlayerView playerView, String message, CardView card) {
+        promptText = message == null ? "" : message;
+        promptChanged();
+    }
+
+    @Override
+    public synchronized void updateButtons(PlayerView owner, String l1, String l2, boolean e1, boolean e2, boolean focus1) {
+        label1 = l1 == null ? "" : l1;
+        label2 = l2 == null ? "" : l2;
+        enable1 = e1;
+        enable2 = e2;
+        promptChanged();
+    }
+
+    @Override
+    public synchronized void setSelectables(Iterable<CardView> cards, int min, int max) {
+        super.setSelectables(cards, min, max);
+        selectables.clear();
+        if (cards != null) cards.forEach(selectables::add);
+        promptChanged();
+    }
+
+    @Override
+    public synchronized void clearSelectables() {
+        super.clearSelectables();
+        selectables.clear();
+        promptChanged();
+    }
+
+    @Override
+    public void setOriginalGameController(PlayerView view, IGameController gameController) {
+        super.setOriginalGameController(view, gameController);
+        synchronized (this) {
+            if (gameController != null) {
+                me = view;
+                controller = gameController;
+                gameOver = false;
+                notifyAll();
+            }
+        }
+    }
+
+    @Override
+    public void setGameController(PlayerView player, IGameController gameController) {
+        super.setGameController(player, gameController);
+        synchronized (this) {
+            if (gameController != null) controller = gameController;
+        }
+    }
+
+    @Override
+    public void finishGame() {
+        synchronized (this) {
+            gameOver = true;
+            notifyAll();
+        }
+    }
+
+    @Override
+    public void afterGameEnd() {
+        super.afterGameEnd();
+        finishGame();
+    }
+
+    void nextGame(forge.gamemodes.match.NextGameDecision decision) {
+        if (controller != null) controller.nextGameDecision(decision);
+        synchronized (this) {
+            gameOver = false;
+        }
+    }
+
+    void forfeit() {
+        if (controller != null) controller.concede();
+    }
+
+    // ---- display callbacks this client has no use for ----
+
+    @Override protected void updateCurrentPlayer(PlayerView player) { }
+    @Override public boolean isUiSetToSkipPhase(PlayerView playerTurn, PhaseType phase) { return false; }
+    @Override public PlayerZoneUpdates openZones(PlayerView controller, Collection<ZoneType> zones, Map<PlayerView, Object> players, boolean backupLastZones) { return null; }
+    @Override public void restoreOldZones(PlayerView playerView, PlayerZoneUpdates playerZoneUpdates) { }
+    @Override public void openView(TrackableCollection<PlayerView> myPlayers) { }
+    @Override public void showCombat() { }
+    @Override public synchronized void flashIncorrectAction() { notices.add("Forge rejected the last action."); }
+    @Override public void alertUser() { }
+    @Override public void updatePhase(boolean saveState) { }
+    @Override public void updateTurn(PlayerView player) { }
+    @Override public void updatePlayerControl() { }
+    @Override public void enableOverlay() { }
+    @Override public void disableOverlay() { }
+    @Override public void showManaPool(PlayerView player) { }
+    @Override public void hideManaPool(PlayerView player) { }
+    @Override public void updateStack() { }
+    @Override public Iterable<PlayerZoneUpdate> tempShowZones(PlayerView controller, Iterable<PlayerZoneUpdate> zonesToUpdate) { return zonesToUpdate; }
+    @Override public void hideZones(PlayerView controller, Iterable<PlayerZoneUpdate> zonesToUpdate) { }
+    @Override public void updateZones(Iterable<PlayerZoneUpdate> zonesToUpdate) { }
+    @Override public void updateCards(Iterable<CardView> cards) { }
+    @Override public GameState getGamestate() { return null; }
+    @Override public void updateManaPool(Iterable<PlayerView> manaPoolUpdate) { }
+    @Override public void updateLives(Iterable<PlayerView> livesUpdate) { }
+    @Override public void updateShards(Iterable<PlayerView> shardsUpdate) { }
+    @Override public void setPanelSelection(CardView hostCard) { }
+    @Override public synchronized void message(String message, String title) { notices.add(title + ": " + message); }
+    @Override public synchronized void showErrorDialog(String message, String title) { notices.add("ERROR " + title + ": " + message); }
+    @Override
+    public synchronized <T> void reveal(String message, List<T> items) {
+        notices.add("REVEALED — " + message + ": " + String.join("; ", describeAll(items, null)));
+    }
+
+    @Override
+    public void updateRevealedCards(TrackableCollection<CardView> collection) {
+        super.updateRevealedCards(collection);
+        if (collection == null || collection.isEmpty()) return;
+        synchronized (this) {
+            notices.add("REVEALED: " + String.join("; ", describeAll(collection, null)));
+        }
+    }
+
+    @Override public void setCard(CardView card) { }
+    @Override public void setPlayerAvatar(LobbyPlayer player, IHasIcon ihi) { }
+}
