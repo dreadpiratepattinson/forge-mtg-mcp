@@ -181,6 +181,9 @@ final class Session {
 
     String cards(List<Integer> ids) {
         ClaudeGuiGame g = requireGui();
+        if (ids == null || ids.isEmpty()) {
+            throw new IllegalArgumentException("Give card ids as a list, e.g. {\"ids\":[187]}.");
+        }
         StringBuilder sb = new StringBuilder();
         for (int id : ids) {
             CardView c = g.findCard(id);

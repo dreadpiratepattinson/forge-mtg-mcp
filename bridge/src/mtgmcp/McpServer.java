@@ -156,7 +156,7 @@ public final class McpServer {
                             "with_state", "boolean", "Include the full board. Default true.", false)),
             new Tool("forge_act", "Answer the open decision. The DECISION text says which answers it accepts.",
                     schema("decision", "integer", "The decision number, from DECISION #n.", true,
-                            "answer", "string", "For a prompt: 'ok', 'cancel', 'card <id>', 'player <index>', several joined by ';'. "
+                            "answer", "string", "For a prompt: 'ok', 'cancel', 'undo' (when cancel is Undo), 'card <id>', 'player <index>', several joined by ';'. "
                                     + "For a dialog: indices like '0,2', 'yes'/'no', 'none', or 'i=n' pairs.", true)),
             new Tool("forge_state", "Return the full board: players, life, zones, stack, combat.", schema()),
             new Tool("forge_card", "Return the full rules text of visible cards.",

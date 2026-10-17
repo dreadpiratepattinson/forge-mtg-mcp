@@ -37,5 +37,5 @@ Logs go to `build/`.
 5. Likely Forge 2.0.16 host bug (not yet reproduced on purpose): if the host clicks End Turn and so skips a block declaration against our attack,
    the host crashes at combat damage (NPE in `Combat.assignAttackersDamage`). Ask the host to click OK at blocks.
 
-Prompt answers: `ok`, `cancel`, `card <id>`, `player <index>`, joined with `;`. On a mana payment prompt,
+Prompt answers: `ok`, `cancel`, `undo` (required when cancel means Undo), `card <id>`, `player <index>`, joined with `;`. On a mana payment prompt,
 `ok` is Forge's auto-pay. Attackers and blockers: click creatures with `card <id>`, then `ok`.

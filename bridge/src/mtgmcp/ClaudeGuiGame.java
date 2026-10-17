@@ -53,6 +53,10 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     private long promptVersion, consumedVersion, lastChange;
     /** Prompt version just before the last click of an answer; prompts up to it are stale. */
     private long lastClickVersion;
+    /** Set when an answer had only card/player clicks; such a click can leave Forge's prompt unchanged. */
+    private boolean clickOnlyAnswer;
+    private long answeredAt;
+    private static final long RESHOW_NANOS = 6_000_000_000L;
     private Decision prompt;
     private boolean gameOver;
     /** Messages and errors from the server since the last forge_wait. */
@@ -81,6 +85,15 @@ final class ClaudeGuiGame extends NetworkGuiGame {
             if (dialog != null && !dialog.reply.isDone()) return dialog;
             if (gameOver) return null;
             long now = System.nanoTime();
+            // A click Forge ignored (no new prompt) leaves its prompt live: show it again.
+            if (clickOnlyAnswer && promptVersion == consumedVersion && now - answeredAt >= RESHOW_NANOS
+                    && controller != null && (enable1 || enable2 || !selectables.isEmpty())) {
+                Log.info("re-showing prompt v" + promptVersion + " after a click with no effect");
+                clickOnlyAnswer = false;
+                consumedVersion = promptVersion - 1;
+                prompt = null;
+                continue;
+            }
             if (promptOpen()) {
                 if (now - lastChange >= SETTLE_NANOS) {
                     if (isPriorityPrompt() && shouldAutoPass()) {
@@ -125,6 +138,9 @@ final class ClaudeGuiGame extends NetworkGuiGame {
             } else {
                 // The server can send the next prompt while the answer is applied; that prompt stays open.
                 consumedVersion = Math.max(consumedVersion, Math.max(answeredVersion, lastClickVersion));
+                String low = answer.trim().toLowerCase();
+                clickOnlyAnswer = !low.matches(".*\\b(ok|cancel)\\b.*");
+                answeredAt = System.nanoTime();
                 if (promptVersion == answeredVersion) prompt = null;
             }
             notifyAll();
@@ -145,6 +161,7 @@ final class ClaudeGuiGame extends NetworkGuiGame {
         while (true) {
             long now = System.nanoTime();
             if (promptVersion > v && now - lastChange >= SETTLE_NANOS) return;
+            if (dialog != null && !dialog.reply.isDone()) return; // Forge asked a question mid-chain
             long left = deadline - now;
             if (left <= 0) return;
             wait(Math.max(1, Math.min(left, SETTLE_NANOS) / 1_000_000L));
@@ -152,6 +169,7 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     }
 
     private void promptChanged() {
+        clickOnlyAnswer = false; // Forge reacted; nothing to re-show
         promptVersion++;
         lastChange = System.nanoTime();
         prompt = null;
@@ -168,7 +186,8 @@ final class ClaudeGuiGame extends NetworkGuiGame {
 
     private boolean shouldAutoPass() {
         GameView gv = getGameView();
-        if (gv == null || label2.startsWith(Localizer.getInstance().getMessage("lblUndo"))) return false;
+        if (gv == null) return false;
+        // The stack rules apply even when the cancel button reads Undo: Forge shows Undo after a pass too.
         if (!gv.getStack().isEmpty()) {
             boolean allMine = passOnOwnStack, allAbilities = passOnAbilities;
             for (StackItemView si : gv.getStack()) {
@@ -177,6 +196,7 @@ final class ClaudeGuiGame extends NetworkGuiGame {
             }
             return allMine || allAbilities;
         }
+        if (isUndo()) return false; // we just acted (e.g. played a land): keep the phase open
         boolean myTurn = gv.getPlayerTurn() != null && gv.getPlayerTurn().getId() == me.getId();
         return !(myTurn ? myStops : oppStops).contains(gv.getPhase());
     }
@@ -187,7 +207,13 @@ final class ClaudeGuiGame extends NetworkGuiGame {
         List<String> opts = new ArrayList<>();
         StringBuilder how = new StringBuilder();
         if (enable1) how.append("'ok' = ").append(label1).append(". ");
-        if (enable2) how.append("'cancel' = ").append(label2).append(". ");
+        if (enable2) {
+            how.append("'cancel' = ").append(label2);
+            if (isUndo()) how.append(" (takes back your last action, it does NOT end the turn; send 'undo' to use it)");
+            else if (label2.startsWith(Localizer.getInstance().getMessage("lblEndTurn")))
+                how.append(" (passes every priority until this turn ends: you cannot respond to anything; use 'ok' to keep responses open)");
+            how.append(". ");
+        }
         if (!selectables.isEmpty()) {
             how.append("'card <id>' selects one of the cards below. ");
             for (CardView c : selectables) opts.add(Render.cardLine(c));
@@ -201,23 +227,43 @@ final class ClaudeGuiGame extends NetworkGuiGame {
         return new Decision(nextId++, "prompt", text, opts, how.toString(), this::actOnPrompt);
     }
 
+    private boolean isUndo() {
+        return label2 != null && label2.startsWith(Localizer.getInstance().getMessage("lblUndo"));
+    }
+
     private Object actOnPrompt(String answer) {
         List<Runnable> actions = new ArrayList<>();
-        for (String part : answer.split(";")) {
-            String[] w = part.trim().split("\\s+");
+        String[] parts = answer.split(";");
+        for (int k = 0; k < parts.length; k++) {
+            String[] w = parts[k].trim().split("\\s+");
             String verb = w[0].toLowerCase();
+            // Agents sent 'cancel' meaning "pass" or "end turn" and undid a resolved spell; Undo must be asked for by name.
+            if (k == 0 && verb.equals("cancel") && enable2 && isUndo())
+                throw new IllegalArgumentException("'cancel' is Undo here (it takes back your last action). Send 'undo' to undo, or 'ok' to pass.");
+            if (verb.equals("undo")) {
+                if (k == 0 && !(enable2 && isUndo())) throw new IllegalArgumentException("There is nothing to undo now.");
+                verb = "cancel";
+            }
             switch (verb) {
                 case "ok" -> {
-                    if (!enable1) throw new IllegalArgumentException("'" + label1 + "' (ok) is disabled now.");
+                    if (k == 0 && !enable1) throw new IllegalArgumentException("'" + label1 + "' (ok) is disabled now.");
                     actions.add(controller::selectButtonOk);
                 }
                 case "cancel" -> {
-                    if (!enable2) throw new IllegalArgumentException("'" + label2 + "' (cancel) is disabled now.");
+                    if (k == 0 && !enable2) throw new IllegalArgumentException("'" + label2 + "' (cancel) is disabled now.");
                     actions.add(controller::selectButtonCancel);
                 }
                 case "card" -> {
                     for (int i = 1; i < w.length; i++) {
-                        CardView c = findCard(Integer.parseInt(w[i]));
+                        int id = Integer.parseInt(w[i]);
+                        // A creature whose trigger is on the stack matches both; a card the prompt lists as selectable wins.
+                        boolean listed = selectables.stream().anyMatch(c -> c.getId() == id);
+                        StackItemView si = listed ? null : findStackItem(id);
+                        if (si != null) { // a spell on the stack is picked as a stack item, e.g. as a counterspell target
+                            actions.add(() -> controller.selectStackItem(si));
+                            continue;
+                        }
+                        CardView c = findCard(id);
                         if (c == null) throw new IllegalArgumentException("No visible card with id " + w[i] + ".");
                         actions.add(() -> controller.selectCard(c, null, null));
                     }
@@ -226,7 +272,7 @@ final class ClaudeGuiGame extends NetworkGuiGame {
                     PlayerView p = findPlayer(w.length > 1 ? w[1] : "");
                     actions.add(() -> controller.selectPlayer(p, null));
                 }
-                default -> throw new IllegalArgumentException("Unknown action '" + verb + "'. Use ok, cancel, card <id>, player <index>.");
+                default -> throw new IllegalArgumentException("Unknown action '" + verb + "'. Use ok, cancel, undo, card <id>, player <index>.");
             }
         }
         // Each click changes the prompt; the next click must go to the new prompt, not the old one.
@@ -241,7 +287,24 @@ final class ClaudeGuiGame extends NetworkGuiGame {
                     Thread.currentThread().interrupt();
                     break;
                 }
+                synchronized (this) {
+                    if (dialog != null && !dialog.reply.isDone()) {
+                        notices.add("Only the first " + (i + 1) + " of " + actions.size()
+                                + " actions were sent: Forge asked a question (DECISION #" + dialog.id
+                                + "; forge_wait shows it). Answer it, then send the rest.");
+                        break;
+                    }
+                }
             }
+        }
+        return null;
+    }
+
+    private StackItemView findStackItem(int id) {
+        GameView gv = getGameView();
+        if (gv == null) return null;
+        for (StackItemView si : gv.getStack()) {
+            if (si.getSourceCard() != null && si.getSourceCard().getId() == id) return si;
         }
         return null;
     }
@@ -323,6 +386,21 @@ final class ClaudeGuiGame extends NetworkGuiGame {
         return out;
     }
 
+    /** Lets a list dialog of cards take 'card 241' as well as an index: each card id becomes its index. */
+    private static <T> String cardIdsToIndices(String answer, List<T> choices) {
+        if (!answer.toLowerCase().contains("card")) return answer;
+        List<String> out = new ArrayList<>();
+        for (String s : answer.toLowerCase().replace("card", " ").split("[,;\\s]+")) {
+            if (s.isEmpty()) continue;
+            int id = Integer.parseInt(s), at = -1;
+            for (int i = 0; i < choices.size(); i++)
+                if (choices.get(i) instanceof CardView c && c.getId() == id) at = i;
+            if (at < 0) throw new IllegalArgumentException("No card with id " + id + " in this list; answer with its index.");
+            out.add(String.valueOf(at));
+        }
+        return String.join(",", out);
+    }
+
     private static boolean yesNo(String a) {
         String s = a.toLowerCase();
         if (s.startsWith("y") || s.equals("true") || s.equals("0")) return true;
@@ -385,7 +463,7 @@ final class ClaudeGuiGame extends NetworkGuiGame {
                 "indices separated by commas, between " + lo + " and " + hi + " of them" + (lo == 0 ? " ('none' for zero)" : "") + ".",
                 a -> {
                     List<T> out = new ArrayList<>();
-                    for (int i : indices(a, choices.size(), lo, hi)) out.add(choices.get(i));
+                    for (int i : indices(cardIdsToIndices(a, choices), choices.size(), lo, hi)) out.add(choices.get(i));
                     return out;
                 });
     }
@@ -393,12 +471,24 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     @Override
     public <T> IGuiGame.OrderResult<T> order(String title, String top, int remainingObjectsMin, int remainingObjectsMax, List<T> sourceChoices, List<T> destChoices, CardView referenceCard, boolean sideboardingMode, boolean showRememberCheckbox) {
         String text = title + (top != null ? " (first = " + top + ")" : "");
-        return ask("order", text, describeAll(sourceChoices, null),
-                "all indices in the new order, first one first, or 'keep' for the order shown.",
+        // A "reorder" prompt can put every item in destChoices and leave sourceChoices empty; order them all.
+        List<T> items = new ArrayList<>();
+        if (sourceChoices != null) items.addAll(sourceChoices);
+        if (destChoices != null) for (T t : destChoices) if (!items.contains(t)) items.add(t);
+        return ask("order", text, describeAll(items, null),
+                "all indices in the new order, first one first; or 'keep' for the order shown; or 'bottom <indices>' "
+                        + "to move those items to the end and keep the rest in place.",
                 a -> {
-                    if (a.equalsIgnoreCase("keep")) return new IGuiGame.OrderResult<>(sourceChoices, false);
+                    if (a.equalsIgnoreCase("keep")) return new IGuiGame.OrderResult<>(items, false);
+                    if (a.toLowerCase().startsWith("bottom")) {
+                        List<Integer> low = indices(a.substring(6), items.size(), 0, items.size());
+                        List<T> out = new ArrayList<>();
+                        for (int i = 0; i < items.size(); i++) if (!low.contains(i)) out.add(items.get(i));
+                        for (int i : low) out.add(items.get(i));
+                        return new IGuiGame.OrderResult<>(out, false);
+                    }
                     List<T> out = new ArrayList<>();
-                    for (int i : indices(a, sourceChoices.size(), sourceChoices.size(), sourceChoices.size())) out.add(sourceChoices.get(i));
+                    for (int i : indices(a, items.size(), items.size(), items.size())) out.add(items.get(i));
                     return new IGuiGame.OrderResult<>(out, false);
                 });
     }
@@ -605,7 +695,13 @@ final class ClaudeGuiGame extends NetworkGuiGame {
     @Override public boolean isUiSetToSkipPhase(PlayerView playerTurn, PhaseType phase) { return false; }
     @Override public void openView(TrackableCollection<PlayerView> myPlayers) { }
     @Override public void showCombat() { }
-    @Override public synchronized void flashIncorrectAction() { notices.add("Forge rejected the last action."); }
+    @Override public synchronized void flashIncorrectAction() {
+        notices.add("Forge rejected the last action.");
+        // The prompt stays as it was; reopen it so the player can answer again.
+        if (consumedVersion >= promptVersion) consumedVersion = promptVersion - 1;
+        prompt = null;
+        notifyAll();
+    }
     @Override public void alertUser() { }
     @Override public void updatePhase(boolean saveState) { }
     @Override public void updateTurn(PlayerView player) { }
