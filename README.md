@@ -82,3 +82,7 @@ The server speaks MCP over stdio. Its command is `scripts/run-mcp.sh`, with no a
 
 The LLM sees only what a human opponent would see in the Forge window. The client hides cards with
 Forge's own visibility rule.
+
+## Licence
+
+GPL-3.0, the same licence as Forge, which the client loads at run time. See `LICENSE`.

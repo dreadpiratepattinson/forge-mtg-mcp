@@ -24,6 +24,7 @@ import java.util.List;
 
 /** One connection to a Forge host, and the state the MCP tools read from it. */
 final class Session {
+    // run-mcp.sh sets FORGE_DECKS from %APPDATA% on WSL; ~/.forge/decks is Forge's folder on Linux
     static final File DECKS = new File(System.getenv().getOrDefault("FORGE_DECKS",
             System.getProperty("user.home") + "/.forge/decks"));
 
