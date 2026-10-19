@@ -7,6 +7,9 @@ headless Forge client, so Forge's own rules engine runs the whole game.
 Any LLM client that supports MCP over stdio can use it. It has only been tested with Claude
 (in Claude Code).
 
+This is a hobby project, provided as is. I read issues and pull requests when I have free time,
+which can take weeks.
+
 ## How to play
 
 1. In Forge, open **Online Multiplayer** and host a game. The default port is 36743.
